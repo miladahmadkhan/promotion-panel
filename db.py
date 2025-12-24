@@ -1,6 +1,6 @@
 import sqlite3
 from contextlib import contextmanager
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Dict
 import os
 import datetime as dt
 
@@ -26,6 +26,7 @@ def init_db():
     with get_conn() as conn:
         c = conn.cursor()
 
+        # USERS
         c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,13 +40,24 @@ def init_db():
         )
         """)
 
+        # TEMP PASSWORD REGISTRY (Admin-only usage for distribution/export)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS user_temp_passwords (
+            user_id INTEGER PRIMARY KEY,
+            temp_password TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """)
+
+        # EVALUATIONS
         c.execute("""
         CREATE TABLE IF NOT EXISTS evaluations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             candidate_id TEXT NOT NULL,
             candidate_name TEXT NOT NULL,
-            level_path TEXT NOT NULL,   -- e.g. Specialist → Senior Specialist
-            target_level TEXT NOT NULL, -- derived: Senior Specialist
+            level_path TEXT NOT NULL,   -- e.g. Senior Specialist → Lead Expert
+            target_level TEXT NOT NULL, -- derived from level_path
             created_by INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'OPEN', -- OPEN | READY_FOR_APPROVER | CLOSED
@@ -53,6 +65,7 @@ def init_db():
         )
         """)
 
+        # ASSIGNMENTS
         c.execute("""
         CREATE TABLE IF NOT EXISTS assignments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +79,7 @@ def init_db():
         )
         """)
 
+        # RESPONSES (8 dimensions)
         c.execute("""
         CREATE TABLE IF NOT EXISTS responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +101,7 @@ def init_db():
         )
         """)
 
+        # APPROVER RESPONSE
         c.execute("""
         CREATE TABLE IF NOT EXISTS approver_responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,6 +122,7 @@ def init_db():
         )
         """)
 
+        # DECISIONS
         c.execute("""
         CREATE TABLE IF NOT EXISTS decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,7 +137,7 @@ def init_db():
         """)
 
 
-# ---------- USERS ----------
+# ---------------- USERS ----------------
 def user_by_username(username: str):
     with get_conn() as conn:
         cur = conn.execute("SELECT * FROM users WHERE username = ?", (username,))
@@ -134,20 +150,75 @@ def user_by_id(user_id: int):
         return cur.fetchone()
 
 
+def list_users(include_inactive: bool = True) -> List[sqlite3.Row]:
+    q = """
+    SELECT u.*,
+           t.temp_password AS temp_password,
+           t.created_at AS temp_password_created_at
+    FROM users u
+    LEFT JOIN user_temp_passwords t ON t.user_id = u.id
+    """
+    params: Tuple[Any, ...] = ()
+    if not include_inactive:
+        q += " WHERE u.is_active = 1"
+    q += " ORDER BY u.created_at DESC"
+    with get_conn() as conn:
+        return conn.execute(q, params).fetchall()
+
+
 def create_user(username: str, full_name: str, email: str, role: str, password_hash: str) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO users (username, full_name, email, role, password_hash, is_active, created_at) VALUES (?,?,?,?,?,?,?)",
+            """
+            INSERT INTO users (username, full_name, email, role, password_hash, is_active, created_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
             (username, full_name, email, role, password_hash, 1, now_iso())
         )
         return int(cur.lastrowid)
 
 
-# ---------- EVALUATIONS ----------
+def update_user(user_id: int, full_name: str, email: str, role: str, is_active: int):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET full_name=?, email=?, role=?, is_active=?
+            WHERE id=?
+            """,
+            (full_name, email, role, int(is_active), user_id)
+        )
+
+
+def update_user_password_hash(user_id: int, password_hash: str):
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (password_hash, user_id))
+
+
+def set_temp_password(user_id: int, temp_password: str):
+    with get_conn() as conn:
+        conn.execute("""
+            INSERT INTO user_temp_passwords (user_id, temp_password, created_at)
+            VALUES (?,?,?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET temp_password=excluded.temp_password, created_at=excluded.created_at
+        """, (user_id, temp_password, now_iso()))
+
+
+def get_temp_password(user_id: int) -> Optional[str]:
+    with get_conn() as conn:
+        row = conn.execute("SELECT temp_password FROM user_temp_passwords WHERE user_id=?", (user_id,)).fetchone()
+        return row["temp_password"] if row else None
+
+
+# ---------------- EVALUATIONS ----------------
 def create_evaluation(candidate_id: str, candidate_name: str, level_path: str, target_level: str, created_by: int) -> int:
     with get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO evaluations (candidate_id, candidate_name, level_path, target_level, created_by, created_at, status) VALUES (?,?,?,?,?,?,?)",
+            """
+            INSERT INTO evaluations (candidate_id, candidate_name, level_path, target_level, created_by, created_at, status)
+            VALUES (?,?,?,?,?,?,?)
+            """,
             (candidate_id, candidate_name, level_path, target_level, created_by, now_iso(), "OPEN")
         )
         eval_id = int(cur.lastrowid)
@@ -179,11 +250,14 @@ def set_evaluation_status(eval_id: int, status: str):
         conn.execute("UPDATE evaluations SET status = ? WHERE id = ?", (status, eval_id))
 
 
-# ---------- ASSIGNMENTS ----------
+# ---------------- ASSIGNMENTS ----------------
 def create_assignment(eval_id: int, user_id: int, evaluator_role: str):
     with get_conn() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO assignments (evaluation_id, user_id, evaluator_role, created_at) VALUES (?,?,?,?)",
+            """
+            INSERT OR REPLACE INTO assignments (evaluation_id, user_id, evaluator_role, created_at)
+            VALUES (?,?,?,?)
+            """,
             (eval_id, user_id, evaluator_role, now_iso())
         )
 
@@ -220,7 +294,7 @@ def get_assignment(eval_id: int, user_id: int):
         """, (eval_id, user_id)).fetchone()
 
 
-# ---------- RESPONSES ----------
+# ---------------- RESPONSES ----------------
 def upsert_response(eval_id: int, user_id: int, dims: List[str], comment: Optional[str]):
     with get_conn() as conn:
         conn.execute("""
@@ -258,7 +332,7 @@ def list_responses_for_evaluation(eval_id: int):
         """, (eval_id,)).fetchall()
 
 
-# ---------- APPROVER RESPONSE ----------
+# ---------------- APPROVER RESPONSE ----------------
 def upsert_approver_response(eval_id: int, approver_user_id: int, dims: List[str], comment: Optional[str]):
     with get_conn() as conn:
         conn.execute("""
@@ -285,13 +359,15 @@ def get_approver_response(eval_id: int):
         return conn.execute("SELECT * FROM approver_responses WHERE evaluation_id = ?", (eval_id,)).fetchone()
 
 
-# ---------- DECISIONS ----------
+# ---------------- DECISIONS ----------------
 def get_decision(eval_id: int):
     with get_conn() as conn:
         return conn.execute("SELECT * FROM decisions WHERE evaluation_id = ?", (eval_id,)).fetchone()
 
 
-def set_decision(eval_id: int, committee_decision: Optional[str] = None, final_decision: Optional[str] = None,
+def set_decision(eval_id: int,
+                 committee_decision: Optional[str] = None,
+                 final_decision: Optional[str] = None,
                  decided_by: Optional[int] = None):
     with get_conn() as conn:
         if committee_decision is not None:
