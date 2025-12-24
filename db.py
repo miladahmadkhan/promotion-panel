@@ -31,7 +31,6 @@ def init_db():
     with get_conn() as conn:
         c = conn.cursor()
 
-        # USERS
         c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +44,6 @@ def init_db():
         )
         """)
 
-        # TEMP PASSWORD REGISTRY (Admin-only export)
         c.execute("""
         CREATE TABLE IF NOT EXISTS user_temp_passwords (
             user_id INTEGER PRIMARY KEY,
@@ -55,7 +53,6 @@ def init_db():
         )
         """)
 
-        # DEPARTMENTS
         c.execute("""
         CREATE TABLE IF NOT EXISTS departments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +61,6 @@ def init_db():
         )
         """)
 
-        # HRBP ↔ Departments mapping
         c.execute("""
         CREATE TABLE IF NOT EXISTS hrbp_departments (
             hrbp_user_id INTEGER NOT NULL,
@@ -76,7 +72,6 @@ def init_db():
         )
         """)
 
-        # EVALUATIONS
         c.execute("""
         CREATE TABLE IF NOT EXISTS evaluations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,11 +87,9 @@ def init_db():
         )
         """)
 
-        # MIGRATION: ensure department column exists (if upgrading from old DB)
         if not _table_has_column(conn, "evaluations", "department"):
             conn.execute("ALTER TABLE evaluations ADD COLUMN department TEXT")
 
-        # ASSIGNMENTS
         c.execute("""
         CREATE TABLE IF NOT EXISTS assignments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,7 +103,6 @@ def init_db():
         )
         """)
 
-        # RESPONSES
         c.execute("""
         CREATE TABLE IF NOT EXISTS responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,7 +124,6 @@ def init_db():
         )
         """)
 
-        # APPROVER RESPONSE
         c.execute("""
         CREATE TABLE IF NOT EXISTS approver_responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,7 +144,6 @@ def init_db():
         )
         """)
 
-        # DECISIONS
         c.execute("""
         CREATE TABLE IF NOT EXISTS decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,17 +222,23 @@ def set_temp_password(user_id: int, temp_password: str):
         """, (user_id, temp_password, now_iso()))
 
 
-def get_temp_password(user_id: int) -> Optional[str]:
+def delete_user(user_id: int):
+    """
+    Hard delete user and related data.
+    NOTE: This removes historical votes/assignments for that user.
+    """
     with get_conn() as conn:
-        row = conn.execute("SELECT temp_password FROM user_temp_passwords WHERE user_id=?", (user_id,)).fetchone()
-        return row["temp_password"] if row else None
+        conn.execute("DELETE FROM user_temp_passwords WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM hrbp_departments WHERE hrbp_user_id=?", (user_id,))
+        conn.execute("DELETE FROM responses WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM assignments WHERE user_id=?", (user_id,))
+        # approver_responses references approver_user_id (rare)
+        conn.execute("DELETE FROM approver_responses WHERE approver_user_id=?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
 
 
 # ---------------- DEPARTMENTS ----------------
 def create_department(name: str) -> Optional[int]:
-    """
-    Insert department if not exists. Returns id if created, else None.
-    """
     name = (name or "").strip()
     if not name:
         return None
@@ -254,9 +250,6 @@ def create_department(name: str) -> Optional[int]:
 
 
 def bulk_upsert_departments(names: List[str]) -> dict:
-    """
-    Insert many departments (ignore duplicates). Returns stats.
-    """
     cleaned = []
     seen = set()
     for n in names:
@@ -290,17 +283,7 @@ def delete_department(dept_id: int):
         conn.execute("DELETE FROM departments WHERE id=?", (dept_id,))
 
 
-def set_hrbp_departments(hrbp_user_id: int, department_ids: List[int]):
-    department_ids = [int(x) for x in department_ids]
-    with get_conn() as conn:
-        conn.execute("DELETE FROM hrbp_departments WHERE hrbp_user_id=?", (hrbp_user_id,))
-        for did in department_ids:
-            conn.execute(
-                "INSERT OR IGNORE INTO hrbp_departments (hrbp_user_id, department_id, created_at) VALUES (?,?,?)",
-                (hrbp_user_id, did, now_iso())
-            )
-
-
+# ---------------- HRBP <-> Department mapping (both directions) ----------------
 def get_hrbp_department_names(hrbp_user_id: int) -> List[str]:
     with get_conn() as conn:
         rows = conn.execute("""
@@ -311,6 +294,50 @@ def get_hrbp_department_names(hrbp_user_id: int) -> List[str]:
             ORDER BY d.name ASC
         """, (hrbp_user_id,)).fetchall()
         return [r["name"] for r in rows]
+
+
+def get_department_hrbps(dept_id: int) -> List[sqlite3.Row]:
+    """
+    Returns HRBP users linked to a department.
+    """
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT u.*
+            FROM hrbp_departments hd
+            JOIN users u ON u.id = hd.hrbp_user_id
+            WHERE hd.department_id = ?
+            ORDER BY u.full_name ASC
+        """, (dept_id,)).fetchall()
+
+
+def set_department_hrbps(dept_id: int, hrbp_user_ids: List[int]):
+    """
+    Sets HRBPs for a department. Also auto-upgrades their role to HRBP (requirement).
+    """
+    hrbp_user_ids = sorted({int(x) for x in hrbp_user_ids})
+    with get_conn() as conn:
+        conn.execute("DELETE FROM hrbp_departments WHERE department_id=?", (int(dept_id),))
+        for uid in hrbp_user_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO hrbp_departments (hrbp_user_id, department_id, created_at) VALUES (?,?,?)",
+                (uid, int(dept_id), now_iso())
+            )
+            # Auto-set access: user becomes HRBP
+            conn.execute("UPDATE users SET role='HRBP', is_active=1 WHERE id=?", (uid,))
+
+
+def list_hrbp_users(include_inactive: bool = False) -> List[sqlite3.Row]:
+    q = "SELECT * FROM users WHERE role='HRBP'"
+    if not include_inactive:
+        q += " AND is_active=1"
+    q += " ORDER BY full_name ASC"
+    with get_conn() as conn:
+        return conn.execute(q).fetchall()
+
+
+def list_non_admin_active_users() -> List[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM users WHERE is_active=1 AND role<>'ADMIN' ORDER BY full_name ASC").fetchall()
 
 
 # ---------------- EVALUATIONS ----------------
