@@ -41,39 +41,26 @@ def _iso(d: dt.date) -> str:
 
 
 def _read_departments_excel(file) -> list:
-    """
-    Expected columns:
-      - Dept Level 2 (preferred)
-    fallback:
-      - any column containing 'dept' or 'department'
-      - otherwise first column
-    """
     df = pd.read_excel(file)
     cols = list(df.columns)
 
-    # preferred
     preferred = None
     for c in cols:
         if str(c).strip().lower() == "dept level 2":
             preferred = c
             break
-
-    # fallback: find dept-like
     if preferred is None:
         for c in cols:
             cl = str(c).strip().lower()
             if "dept" in cl or "department" in cl:
                 preferred = c
                 break
-
     if preferred is None and cols:
         preferred = cols[0]
-
     if preferred is None:
         return []
 
-    names = df[preferred].tolist()
-    return names
+    return df[preferred].tolist()
 
 
 def admin_page():
@@ -82,15 +69,22 @@ def admin_page():
 
     db.init_db()
     rules = logic.get_rules()
-    tabs = st.tabs(["Departments", "Access Management", "Create Evaluation", "Assign Evaluators", "Org Reports", "Monitor & Close"])
 
-    # -------------------- DEPARTMENTS (UPDATED) --------------------
+    tabs = st.tabs([
+        "Departments",
+        "Department ↔ HRBP Mapping",
+        "Access Management",
+        "Create Evaluation",
+        "Assign Evaluators",
+        "Org Reports",
+        "Monitor & Close",
+    ])
+
+    # -------------------- DEPARTMENTS --------------------
     with tabs[0]:
         st.subheader("Departments")
 
         st.markdown("### Bulk import from Excel")
-        st.caption("Your uploaded file format is supported (column: **Dept Level 2**). Duplicates will be ignored.")
-
         up = st.file_uploader("Upload departments.xlsx", type=["xlsx"])
         if up is not None:
             try:
@@ -132,22 +126,69 @@ def admin_page():
             df = pd.DataFrame([{"id": int(d["id"]), "name": d["name"]} for d in depts])
             st.dataframe(df, use_container_width=True)
 
-            st.markdown("### Delete department (careful)")
-            del_id = st.selectbox(
-                "Select department to delete",
+    # -------------------- Department ↔ HRBP Mapping (NEW) --------------------
+    with tabs[1]:
+        st.subheader("Department ↔ HRBP Mapping")
+        depts = db.list_departments()
+        if not depts:
+            st.warning("Import/create departments first.")
+        else:
+            dept_id = st.selectbox(
+                "Select department",
                 options=[int(d["id"]) for d in depts],
                 format_func=lambda i: next((d["name"] for d in depts if int(d["id"]) == int(i)), str(i))
             )
-            if st.button("Delete selected department"):
-                db.delete_department(int(del_id))
-                st.success("Deleted.")
-                st.rerun()
+
+            # Eligible users: all active non-admin users (admin can't be HRBP)
+            eligible = db.list_non_admin_active_users()
+            if not eligible:
+                st.warning("No eligible users found. Create users in Access Management first.")
+            else:
+                current_hrbps = db.get_department_hrbps(int(dept_id))
+                current_ids = [int(u["id"]) for u in current_hrbps]
+
+                # Show current
+                if current_hrbps:
+                    st.caption("Current HRBPs for this department:")
+                    st.dataframe(pd.DataFrame([{
+                        "full_name": u["full_name"],
+                        "username": u["username"],
+                        "email": u["email"],
+                        "role": u["role"],
+                    } for u in current_hrbps]), use_container_width=True)
+                else:
+                    st.info("No HRBP assigned to this department yet.")
+
+                options = [int(u["id"]) for u in eligible]
+                def fmt(uid: int) -> str:
+                    u = next((x for x in eligible if int(x["id"]) == int(uid)), None)
+                    if not u:
+                        return str(uid)
+                    return f"{u['full_name']} ({u['username']}) | {u['email']} | role={u['role']}"
+
+                selected_ids = st.multiselect(
+                    "Select one or more HRBPs for this department",
+                    options=options,
+                    default=current_ids,
+                    format_func=fmt
+                )
+
+                st.warning(
+                    "Note: Saving will automatically set selected users' role to **HRBP** (access will be upgraded)."
+                )
+
+                if st.button("Save Department HRBPs", type="primary"):
+                    db.set_department_hrbps(int(dept_id), selected_ids)
+                    st.success("Saved. HRBP access updated automatically.")
+                    st.rerun()
 
     # -------------------- ACCESS MANAGEMENT --------------------
-    with tabs[1]:
+    with tabs[2]:
         st.subheader("Access Management")
-        sub_tabs = st.tabs(["Create User", "Import Users (Excel/CSV)", "Users List", "HRBP → Departments"])
 
+        sub_tabs = st.tabs(["Create User", "Import Users (Excel/CSV)", "Users List (Edit/Delete)"])
+
+        # Create user
         with sub_tabs[0]:
             username = st.text_input("Username (unique)", placeholder="e.g. milad.ahmadkhan")
             full_name = st.text_input("Full name")
@@ -184,6 +225,7 @@ def admin_page():
                     st.session_state["suggested_pass"] = _gen_password()
                     st.rerun()
 
+        # Import users
         with sub_tabs[1]:
             st.info("Columns: username, full_name, email, role, password (password can be empty)")
             template_df = pd.DataFrame([{
@@ -256,17 +298,25 @@ def admin_page():
                         st.warning(f"Skipped {len(skipped_rows)} rows.")
                         st.dataframe(pd.DataFrame(skipped_rows), use_container_width=True)
 
+        # Users list edit/delete
         with sub_tabs[2]:
+            st.markdown("### Users List (Edit/Delete)")
+
             show_inactive = st.checkbox("Show inactive users", value=True)
             q = st.text_input("Search users", placeholder="username / name / email").strip().lower()
-            users = db.list_users(include_inactive=show_inactive)
 
-            rows = []
+            users = db.list_users(include_inactive=show_inactive)
+            filtered = []
             for u in users:
                 label = f"{u['username']} {u['full_name']} {u['email']} {u['role']}".lower()
                 if q and q not in label:
                     continue
-                rows.append({
+                filtered.append(u)
+
+            if not filtered:
+                st.info("No users match your filter.")
+            else:
+                df_list = pd.DataFrame([{
                     "id": int(u["id"]),
                     "username": u["username"],
                     "full_name": u["full_name"],
@@ -274,55 +324,57 @@ def admin_page():
                     "role": u["role"],
                     "is_active": int(u["is_active"]),
                     "temp_password": u["temp_password"] or "",
-                    "temp_password_created_at": u["temp_password_created_at"] or "",
-                    "created_at": u["created_at"],
-                })
-
-            if rows:
-                df_list = pd.DataFrame(rows)
+                } for u in filtered])
                 st.dataframe(df_list, use_container_width=True)
+
                 st.download_button(
                     "Download users (Excel)",
                     data=_to_excel_bytes(df_list, "users"),
                     file_name="users_access_list.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-            else:
-                st.info("No users match your filter.")
 
-        with sub_tabs[3]:
-            st.markdown("### HRBP → Departments mapping")
-            depts = db.list_departments()
-            if not depts:
-                st.warning("Create/import departments first (Departments tab).")
-            else:
-                users = db.list_users(include_inactive=False)
-                hrbps = [u for u in users if u["role"] == "HRBP" and int(u["is_active"]) == 1]
-                if not hrbps:
-                    st.info("No active HRBP users.")
+                st.divider()
+                st.markdown("### Edit or Delete a user")
+
+                user_id = st.selectbox(
+                    "Select user",
+                    options=[int(u["id"]) for u in filtered],
+                    format_func=lambda uid: next((f"{u['full_name']} ({u['username']}) | {u['role']}" for u in filtered if int(u["id"]) == int(uid)), str(uid))
+                )
+                u0 = db.user_by_id(int(user_id))
+                if not u0:
+                    st.error("User not found.")
                 else:
-                    hrbp_id = st.selectbox(
-                        "Select HRBP user",
-                        options=[int(u["id"]) for u in hrbps],
-                        format_func=lambda uid: next((f"{u['full_name']} ({u['username']})" for u in hrbps if int(u["id"]) == int(uid)), str(uid))
-                    )
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        full_name = st.text_input("Full name", value=u0["full_name"])
+                        email = st.text_input("Email", value=u0["email"])
+                    with col2:
+                        role = st.selectbox("Role", _role_choices(), index=_role_choices().index(u0["role"]))
+                        is_active = st.checkbox("Active", value=bool(int(u0["is_active"])))
 
-                    current = db.get_hrbp_department_names(int(hrbp_id))
-                    dept_names = [d["name"] for d in depts]
-                    selected = st.multiselect("Departments for this HRBP", options=dept_names, default=current)
-
-                    name_to_id = {d["name"]: int(d["id"]) for d in depts}
-                    if st.button("Save mapping", type="primary"):
-                        db.set_hrbp_departments(int(hrbp_id), [name_to_id[n] for n in selected])
-                        st.success("Saved.")
+                    if st.button("Save changes", type="primary"):
+                        # prevent accidentally demoting ADMIN via UI for the main admin user, but still allow if you insist
+                        db.update_user(int(user_id), full_name.strip(), email.strip(), role, int(is_active))
+                        st.success("User updated.")
                         st.rerun()
 
+                    st.warning("Delete is permanent and removes assignments/responses/mappings for this user.")
+                    if st.button("Delete user"):
+                        if u0["role"] == "ADMIN":
+                            st.error("Deleting ADMIN user is blocked to avoid locking yourself out.")
+                        else:
+                            db.delete_user(int(user_id))
+                            st.success("User deleted.")
+                            st.rerun()
+
     # -------------------- CREATE EVALUATION --------------------
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("Create Evaluation")
         depts = db.list_departments()
         if not depts:
-            st.warning("Please create/import departments first (Departments tab).")
+            st.warning("Please import/create departments first.")
         else:
             candidate_id = st.text_input("Candidate ID", placeholder="e.g. DK-12345")
             candidate_name = st.text_input("Candidate Name")
@@ -347,7 +399,7 @@ def admin_page():
                     st.success(f"Evaluation created (ID: {eval_id})")
 
     # -------------------- ASSIGN EVALUATORS --------------------
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("Assign Evaluators")
         evals = db.list_evaluations()
         if not evals:
@@ -409,7 +461,7 @@ def admin_page():
                     st.dataframe(df, use_container_width=True)
 
     # -------------------- ORG REPORTS --------------------
-    with tabs[4]:
+    with tabs[5]:
         st.subheader("Organization Reports (Admin only)")
         today = dt.date.today()
         default_start = today - dt.timedelta(days=183)
@@ -439,7 +491,7 @@ def admin_page():
             )
 
     # -------------------- MONITOR & CLOSE --------------------
-    with tabs[5]:
+    with tabs[6]:
         st.subheader("Monitor & Close")
         evals = db.list_evaluations()
         if not evals:
