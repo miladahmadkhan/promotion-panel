@@ -1,7 +1,3 @@
-import os
-
-if os.path.exists("app.db"):
-    os.remove("app.db")
 import streamlit as st
 import db
 import auth
@@ -41,4 +37,5 @@ elif role == "APPROVER":
     approver_page()
 else:
     st.error("Unknown role.")
+
 
