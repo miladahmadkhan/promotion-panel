@@ -5,9 +5,15 @@ import logic
 
 
 def evaluator_page():
-    user = auth.require_roles("EVALUATOR")
-    st.header("Evaluator Dashboard")
-    st.caption(f"Logged in as: {user['full_name']} ({user['username']})")
+    # فقط لاگین بودن لازم است
+    user = auth.current_user()
+    if not user:
+        st.warning("Please log in.")
+        auth.login_screen()
+        st.stop()
+
+    st.header("My Assigned Evaluations")
+    st.caption(f"Logged in as: {user['full_name']} ({user['username']}) — Role: {user['role']}")
 
     rules = logic.get_rules()
 
@@ -29,9 +35,6 @@ def evaluator_page():
         st.error("Evaluation not found.")
         return
 
-    if ev["status"] == "CLOSED":
-        st.warning("This evaluation is closed. Read-only.")
-
     assign = db.get_assignment(int(eval_id), user["id"])
     if not assign:
         st.error("You are not assigned to this evaluation.")
@@ -41,13 +44,23 @@ def evaluator_page():
     st.write(f"**Promotion Path:** {ev['level_path']}")
     st.write(f"**Target Level:** {ev['target_level']}")
     st.write(
-        f"**Your Role:** {assign['evaluator_role']} "
-        f"(weight = {logic.get_weight(ev['level_path'], assign['evaluator_role']):.0%})"
+        f"**Your Evaluator Role (weight):** {assign['evaluator_role']} "
+        f"({logic.get_weight(ev['level_path'], assign['evaluator_role']):.0%})"
     )
 
     existing = db.get_response(int(eval_id), user["id"])
+    already_submitted = existing is not None
+
+    if already_submitted:
+        st.success("✅ Your response has been submitted.")
+        st.caption("This form is now read-only. If you need changes, ask Admin/HRBP to reopen/reset.")
+
+    if ev["status"] == "CLOSED":
+        st.warning("This evaluation is closed. Read-only.")
+        already_submitted = True
 
     st.markdown("### Provide your ratings")
+
     if existing:
         default_vals = [
             existing["dim1"], existing["dim2"], existing["dim3"], existing["dim4"],
@@ -61,19 +74,14 @@ def evaluator_page():
     dims = []
     for i, dim_name in enumerate(rules.dimensions[:8]):
         idx = logic.RATING_OPTIONS.index(default_vals[i]) if default_vals[i] in logic.RATING_OPTIONS else 1
-        v = st.radio(dim_name, logic.RATING_OPTIONS, index=idx, key=f"dim_{i}")
+        v = st.radio(dim_name, logic.RATING_OPTIONS, index=idx, key=f"dim_{i}", disabled=already_submitted)
         dims.append(v)
 
-    comment = st.text_area("Optional comment", value=existing_comment)
+    comment = st.text_area("Optional comment", value=existing_comment, disabled=already_submitted)
 
-    if ev["status"] == "CLOSED":
-        st.info("Read-only view.")
-        return
+    submit_clicked = st.button("Submit", type="primary", disabled=already_submitted)
 
-    if st.button("Submit", type="primary"):
-        if len(dims) != 8:
-            st.error("Expected 8 dimensions from Sheet2 (A12:A19).")
-            return
+    if submit_clicked:
         db.upsert_response(int(eval_id), user["id"], dims, comment)
-        st.success("Submitted.")
+        st.success("✅ Submitted successfully. Thank you!")
         st.rerun()
