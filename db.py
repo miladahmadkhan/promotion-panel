@@ -1,6 +1,6 @@
 import sqlite3
 from contextlib import contextmanager
-from typing import Any, List, Optional, Tuple, Dict
+from typing import Any, List, Optional, Tuple
 import os
 import datetime as dt
 
@@ -22,6 +22,11 @@ def now_iso() -> str:
     return dt.datetime.utcnow().isoformat(timespec="seconds")
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
 def init_db():
     with get_conn() as conn:
         c = conn.cursor()
@@ -40,7 +45,7 @@ def init_db():
         )
         """)
 
-        # TEMP PASSWORD REGISTRY (Admin-only usage for distribution/export)
+        # TEMP PASSWORD REGISTRY (Admin-only export)
         c.execute("""
         CREATE TABLE IF NOT EXISTS user_temp_passwords (
             user_id INTEGER PRIMARY KEY,
@@ -50,20 +55,46 @@ def init_db():
         )
         """)
 
+        # DEPARTMENTS
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS departments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """)
+
+        # HRBP ↔ Departments mapping
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS hrbp_departments (
+            hrbp_user_id INTEGER NOT NULL,
+            department_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (hrbp_user_id, department_id),
+            FOREIGN KEY(hrbp_user_id) REFERENCES users(id),
+            FOREIGN KEY(department_id) REFERENCES departments(id)
+        )
+        """)
+
         # EVALUATIONS
         c.execute("""
         CREATE TABLE IF NOT EXISTS evaluations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             candidate_id TEXT NOT NULL,
             candidate_name TEXT NOT NULL,
-            level_path TEXT NOT NULL,   -- e.g. Senior Specialist → Lead Expert
-            target_level TEXT NOT NULL, -- derived from level_path
+            level_path TEXT NOT NULL,
+            target_level TEXT NOT NULL,
+            department TEXT,
             created_by INTEGER NOT NULL,
             created_at TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'OPEN', -- OPEN | READY_FOR_APPROVER | CLOSED
+            status TEXT NOT NULL DEFAULT 'OPEN',
             FOREIGN KEY(created_by) REFERENCES users(id)
         )
         """)
+
+        # MIGRATION: ensure department column exists (if upgrading from old DB)
+        if not _table_has_column(conn, "evaluations", "department"):
+            conn.execute("ALTER TABLE evaluations ADD COLUMN department TEXT")
 
         # ASSIGNMENTS
         c.execute("""
@@ -79,7 +110,7 @@ def init_db():
         )
         """)
 
-        # RESPONSES (8 dimensions)
+        # RESPONSES
         c.execute("""
         CREATE TABLE IF NOT EXISTS responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,14 +171,12 @@ def init_db():
 # ---------------- USERS ----------------
 def user_by_username(username: str):
     with get_conn() as conn:
-        cur = conn.execute("SELECT * FROM users WHERE username = ?", (username,))
-        return cur.fetchone()
+        return conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
 
 
 def user_by_id(user_id: int):
     with get_conn() as conn:
-        cur = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-        return cur.fetchone()
+        return conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
 def list_users(include_inactive: bool = True) -> List[sqlite3.Row]:
@@ -158,12 +187,11 @@ def list_users(include_inactive: bool = True) -> List[sqlite3.Row]:
     FROM users u
     LEFT JOIN user_temp_passwords t ON t.user_id = u.id
     """
-    params: Tuple[Any, ...] = ()
     if not include_inactive:
         q += " WHERE u.is_active = 1"
     q += " ORDER BY u.created_at DESC"
     with get_conn() as conn:
-        return conn.execute(q, params).fetchall()
+        return conn.execute(q).fetchall()
 
 
 def create_user(username: str, full_name: str, email: str, role: str, password_hash: str) -> int:
@@ -182,8 +210,7 @@ def update_user(user_id: int, full_name: str, email: str, role: str, is_active: 
     with get_conn() as conn:
         conn.execute(
             """
-            UPDATE users
-            SET full_name=?, email=?, role=?, is_active=?
+            UPDATE users SET full_name=?, email=?, role=?, is_active=?
             WHERE id=?
             """,
             (full_name, email, role, int(is_active), user_id)
@@ -211,15 +238,91 @@ def get_temp_password(user_id: int) -> Optional[str]:
         return row["temp_password"] if row else None
 
 
+# ---------------- DEPARTMENTS ----------------
+def create_department(name: str) -> Optional[int]:
+    """
+    Insert department if not exists. Returns id if created, else None.
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    with get_conn() as conn:
+        cur = conn.execute("INSERT OR IGNORE INTO departments (name, created_at) VALUES (?,?)", (name, now_iso()))
+        if cur.rowcount == 0:
+            return None
+        return int(cur.lastrowid)
+
+
+def bulk_upsert_departments(names: List[str]) -> dict:
+    """
+    Insert many departments (ignore duplicates). Returns stats.
+    """
+    cleaned = []
+    seen = set()
+    for n in names:
+        n = (str(n) if n is not None else "").strip()
+        if not n:
+            continue
+        key = n.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(n)
+
+    created = 0
+    with get_conn() as conn:
+        for n in cleaned:
+            cur = conn.execute("INSERT OR IGNORE INTO departments (name, created_at) VALUES (?,?)", (n, now_iso()))
+            if cur.rowcount == 1:
+                created += 1
+
+    return {"input": len(names), "cleaned": len(cleaned), "created": created, "skipped_existing": len(cleaned) - created}
+
+
+def list_departments() -> List[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM departments ORDER BY name ASC").fetchall()
+
+
+def delete_department(dept_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM hrbp_departments WHERE department_id=?", (dept_id,))
+        conn.execute("DELETE FROM departments WHERE id=?", (dept_id,))
+
+
+def set_hrbp_departments(hrbp_user_id: int, department_ids: List[int]):
+    department_ids = [int(x) for x in department_ids]
+    with get_conn() as conn:
+        conn.execute("DELETE FROM hrbp_departments WHERE hrbp_user_id=?", (hrbp_user_id,))
+        for did in department_ids:
+            conn.execute(
+                "INSERT OR IGNORE INTO hrbp_departments (hrbp_user_id, department_id, created_at) VALUES (?,?,?)",
+                (hrbp_user_id, did, now_iso())
+            )
+
+
+def get_hrbp_department_names(hrbp_user_id: int) -> List[str]:
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT d.name
+            FROM hrbp_departments hd
+            JOIN departments d ON d.id = hd.department_id
+            WHERE hd.hrbp_user_id = ?
+            ORDER BY d.name ASC
+        """, (hrbp_user_id,)).fetchall()
+        return [r["name"] for r in rows]
+
+
 # ---------------- EVALUATIONS ----------------
-def create_evaluation(candidate_id: str, candidate_name: str, level_path: str, target_level: str, created_by: int) -> int:
+def create_evaluation(candidate_id: str, candidate_name: str, level_path: str, target_level: str,
+                      department: str, created_by: int) -> int:
     with get_conn() as conn:
         cur = conn.execute(
             """
-            INSERT INTO evaluations (candidate_id, candidate_name, level_path, target_level, created_by, created_at, status)
-            VALUES (?,?,?,?,?,?,?)
+            INSERT INTO evaluations (candidate_id, candidate_name, level_path, target_level, department, created_by, created_at, status)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
-            (candidate_id, candidate_name, level_path, target_level, created_by, now_iso(), "OPEN")
+            (candidate_id, candidate_name, level_path, target_level, (department or "").strip(), created_by, now_iso(), "OPEN")
         )
         eval_id = int(cur.lastrowid)
         conn.execute(
@@ -238,6 +341,16 @@ def list_evaluations(status: Optional[str] = None) -> List[sqlite3.Row]:
     q += " ORDER BY created_at DESC"
     with get_conn() as conn:
         return conn.execute(q, params).fetchall()
+
+
+def list_evaluations_by_departments(departments: List[str]) -> List[sqlite3.Row]:
+    departments = [d.strip() for d in departments if d and d.strip()]
+    if not departments:
+        return []
+    placeholders = ",".join(["?"] * len(departments))
+    q = f"SELECT * FROM evaluations WHERE department IN ({placeholders}) ORDER BY created_at DESC"
+    with get_conn() as conn:
+        return conn.execute(q, tuple(departments)).fetchall()
 
 
 def get_evaluation(eval_id: int):
@@ -282,6 +395,23 @@ def list_assigned_evaluations_for_user(user_id: int):
             WHERE a.user_id = ?
             ORDER BY e.created_at DESC
         """, (user_id,)).fetchall()
+
+
+def list_assigned_evaluations_for_user_in_departments(user_id: int, departments: List[str]):
+    departments = [d.strip() for d in departments if d and d.strip()]
+    if not departments:
+        return []
+    placeholders = ",".join(["?"] * len(departments))
+    q = f"""
+        SELECT e.*
+        FROM assignments a
+        JOIN evaluations e ON e.id = a.evaluation_id
+        WHERE a.user_id = ? AND e.department IN ({placeholders})
+        ORDER BY e.created_at DESC
+    """
+    params = (user_id, *departments)
+    with get_conn() as conn:
+        return conn.execute(q, params).fetchall()
 
 
 def get_assignment(eval_id: int, user_id: int):
@@ -377,3 +507,19 @@ def set_decision(eval_id: int,
                 "UPDATE decisions SET final_decision=?, decided_by=?, decided_at=? WHERE evaluation_id=?",
                 (final_decision, decided_by, now_iso(), eval_id)
             )
+
+
+# ---------------- ADMIN ORG REPORTS ----------------
+def org_summary_report(start_iso: str, end_iso: str) -> List[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("""
+            SELECT
+                e.target_level AS target_level,
+                COALESCE(NULLIF(d.final_decision,''), NULLIF(d.committee_decision,''), 'Pending') AS decision,
+                COUNT(*) AS cnt
+            FROM evaluations e
+            LEFT JOIN decisions d ON d.evaluation_id = e.id
+            WHERE e.created_at >= ? AND e.created_at < ?
+            GROUP BY e.target_level, decision
+            ORDER BY e.target_level, decision
+        """, (start_iso, end_iso)).fetchall()
