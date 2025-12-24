@@ -39,22 +39,17 @@ def admin_page():
     auth.require_roles("ADMIN")
     st.header("Admin Dashboard")
 
-    # make sure tables exist
     db.init_db()
-
     rules = logic.get_rules()
     tabs = st.tabs(["Access Management", "Create Evaluation", "Assign Evaluators", "Monitor & Close"])
 
     # -------------------- ACCESS MANAGEMENT --------------------
     with tabs[0]:
         st.subheader("Access Management")
-
         sub_tabs = st.tabs(["Create User", "Import Users (Excel/CSV)", "Users List"])
 
-        # Create single user
         with sub_tabs[0]:
             st.markdown("### Create user (single)")
-
             username = st.text_input("Username (unique)", placeholder="e.g. milad.ahmadkhan")
             full_name = st.text_input("Full name")
             email = st.text_input("Email")
@@ -65,11 +60,8 @@ def admin_page():
 
             col1, col2 = st.columns([2, 1])
             with col1:
-                password = st.text_input(
-                    "Password (auto-suggested, editable)",
-                    value=st.session_state["suggested_pass"],
-                    type="default",
-                )
+                password = st.text_input("Password (auto-suggested, editable)",
+                                         value=st.session_state["suggested_pass"])
             with col2:
                 if st.button("Regenerate", use_container_width=True):
                     st.session_state["suggested_pass"] = _gen_password()
@@ -89,20 +81,17 @@ def admin_page():
                         role=role,
                         password_hash=auth.hash_password(password.strip() or "changeme"),
                     )
-                    # store temp password for admin export (optional but requested)
                     db.set_temp_password(uid, password.strip() or "changeme")
                     st.success(f"User created: {u}")
                     st.session_state["suggested_pass"] = _gen_password()
                     st.rerun()
 
-        # Import
         with sub_tabs[1]:
             st.markdown("### Import users from Excel/CSV")
-
             st.info(
-                "Template columns (case-insensitive): **username, full_name, email, role, password**\n\n"
-                "- `password` can be empty → system will generate.\n"
-                "- `role` must be one of: ADMIN, HRBP, APPROVER, EVALUATOR."
+                "Template columns: **username, full_name, email, role, password**\n\n"
+                "- password can be empty → system generates.\n"
+                "- role must be ADMIN/HRBP/APPROVER/EVALUATOR."
             )
 
             template_df = pd.DataFrame([{
@@ -136,8 +125,7 @@ def admin_page():
                         if "password" not in df.columns:
                             df["password"] = ""
 
-                        created_rows = []
-                        skipped_rows = []
+                        created_rows, skipped_rows = [], []
 
                         for _, row in df.iterrows():
                             u = str(row.get("username", "")).strip().lower()
@@ -153,9 +141,7 @@ def admin_page():
                                 skipped_rows.append({"username": u, "reason": f"invalid role: {r}"})
                                 continue
 
-                            pwd = str(row.get("password", "")).strip()
-                            if not pwd:
-                                pwd = _gen_password()
+                            pwd = str(row.get("password", "")).strip() or _gen_password()
 
                             uid = db.create_user(
                                 username=u,
@@ -189,15 +175,12 @@ def admin_page():
                             st.warning(f"Skipped {len(skipped_rows)} rows.")
                             st.dataframe(pd.DataFrame(skipped_rows), use_container_width=True)
 
-        # Users list
         with sub_tabs[2]:
             st.markdown("### Users list")
-
             show_inactive = st.checkbox("Show inactive users", value=True)
             q = st.text_input("Search (username / name / email)", placeholder="type to filter...").strip().lower()
 
             users = db.list_users(include_inactive=show_inactive)
-
             rows = []
             for u in users:
                 label = f"{u['username']} {u['full_name']} {u['email']} {u['role']}".lower()
@@ -215,18 +198,17 @@ def admin_page():
                     "created_at": u["created_at"],
                 })
 
-            if not rows:
-                st.info("No users match your filter.")
-            else:
+            if rows:
                 dfu = pd.DataFrame(rows)
                 st.dataframe(dfu, use_container_width=True)
-
                 st.download_button(
                     "Download users (Excel)",
                     data=_to_excel_bytes(dfu, "users"),
                     file_name="users_access_list.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+            else:
+                st.info("No users match your filter.")
 
     # -------------------- CREATE EVALUATION --------------------
     with tabs[1]:
@@ -259,17 +241,12 @@ def admin_page():
             st.info("No evaluations yet.")
             return
 
-        # searchable evaluation selector
         q = st.text_input("Search candidate", placeholder="type to filter candidate list...").strip().lower()
 
         def _eval_label(e):
             return f"{e['candidate_name']} | {e['level_path']} | #{e['id']}"
 
-        filtered = []
-        for e in evals:
-            if not q or q in _eval_label(e).lower() or q in str(e["candidate_id"]).lower():
-                filtered.append(e)
-
+        filtered = [e for e in evals if (not q) or q in _eval_label(e).lower() or q in str(e["candidate_id"]).lower()]
         if not filtered:
             st.warning("No evaluations match your search.")
             return
@@ -284,31 +261,31 @@ def admin_page():
         allowed_roles = logic.allowed_evaluator_roles_by_level_path(ev["level_path"])
         st.caption(f"Allowed evaluator roles: {', '.join(allowed_roles)}")
 
-        # Choose evaluator from existing active users with role EVALUATOR (from Access Management)
+        # ✅ IMPORTANT CHANGE: any active user (except ADMIN) can be an evaluator
         all_users = db.list_users(include_inactive=False)
-        evaluator_users = [u for u in all_users if u["role"] == "EVALUATOR" and int(u["is_active"]) == 1]
+        eligible = [u for u in all_users if int(u["is_active"]) == 1 and u["role"] != "ADMIN"]
 
-        if not evaluator_users:
-            st.warning("No active EVALUATOR users found. Create/import them in Access Management first.")
+        if not eligible:
+            st.warning("No eligible users found. Create/import users in Access Management first.")
             return
 
-        # searchable user dropdown
-        uq = st.text_input("Search evaluator", placeholder="type username/name/email...").strip().lower()
-        filtered_users = []
-        for u in evaluator_users:
-            s = f"{u['username']} {u['full_name']} {u['email']}".lower()
-            if not uq or uq in s:
-                filtered_users.append(u)
+        uq = st.text_input("Search user", placeholder="type username/name/email...").strip().lower()
+        eligible_filtered = []
+        for u in eligible:
+            s = f"{u['username']} {u['full_name']} {u['email']} {u['role']}".lower()
+            if (not uq) or uq in s:
+                eligible_filtered.append(u)
 
-        if not filtered_users:
-            st.info("No evaluators match your search.")
+        if not eligible_filtered:
+            st.info("No users match your search.")
             return
 
         user_id = st.selectbox(
-            "Select evaluator user",
-            options=[int(u["id"]) for u in filtered_users],
+            "Select user to assign as evaluator",
+            options=[int(u["id"]) for u in eligible_filtered],
             format_func=lambda uid: next(
-                (f"{u['full_name']} ({u['username']}) - {u['email']}" for u in filtered_users if int(u["id"]) == int(uid)),
+                (f"{u['full_name']} ({u['username']}) - {u['email']} | role={u['role']}"
+                 for u in eligible_filtered if int(u["id"]) == int(uid)),
                 str(uid)
             )
         )
@@ -327,7 +304,8 @@ def admin_page():
                 "Name": a["full_name"],
                 "Email": a["email"],
                 "Username": a["username"],
-                "Role": a["evaluator_role"],
+                "User Role": db.user_by_id(int(a["user_id"]))["role"],
+                "Evaluator Role (weight role)": a["evaluator_role"],
             } for a in assigns])
             st.dataframe(df, use_container_width=True)
             st.download_button(
@@ -342,7 +320,6 @@ def admin_page():
     # -------------------- MONITOR & CLOSE --------------------
     with tabs[3]:
         st.subheader("Monitor & Close")
-
         evals = db.list_evaluations()
         if not evals:
             st.info("No evaluations yet.")
